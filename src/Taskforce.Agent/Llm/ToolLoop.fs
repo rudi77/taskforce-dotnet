@@ -2,22 +2,19 @@ namespace Taskforce.Agent.Llm
 
 open System
 open System.Collections.Generic
+open System.Text.Json
 
 [<Sealed>]
 type LlmRouter(adapters: IProviderAdapter list, configs: Map<LlmProvider, LlmConfig>) =
     let resolveAdapter provider =
         match adapters |> List.tryFind (fun adapter -> adapter.Supports provider) with
         | Some adapter -> adapter
-        | None ->
-            LlmError.UnsupportedProvider provider |> LlmError.raiseError
-            failwith "unreachable"
+        | None -> LlmError.UnsupportedProvider provider |> LlmError.raiseError
 
     let resolveConfig provider =
         match configs |> Map.tryFind provider with
         | Some cfg -> cfg
-        | None ->
-            LlmError.MissingProviderConfiguration provider |> LlmError.raiseError
-            failwith "unreachable"
+        | None -> LlmError.MissingProviderConfiguration provider |> LlmError.raiseError
 
     interface ILlmClient with
         member _.Complete request =
@@ -45,22 +42,19 @@ type ReasoningModel(client: ILlmClient) =
                 | None ->
                     LlmError.InvalidProviderResponse(request.Provider, "Structured response did not return text payload")
                     |> LlmError.raiseError
-                    return Unchecked.defaultof<'T>
                 | Some text ->
-                    return System.Text.Json.JsonSerializer.Deserialize<'T>(text)
+                    return JsonSerializer.Deserialize<'T>(text)
             }
 
         member this.RunToolLoop(initialRequest, invokeTool) =
             let rec loop maxIterations (request: LlmRequest) =
                 async {
                     if maxIterations <= 0 then
-                        return {
-                            Text = None
-                            ToolCalls = []
-                            FinishReason = FinishReason.Unknown "tool_loop_iteration_limit"
-                            Usage = None
-                            RawProviderPayload = None
-                        }
+                        LlmError.InvalidProviderResponse(
+                            request.Provider,
+                            "Tool loop iteration limit exceeded before model returned a terminal response"
+                        )
+                        |> LlmError.raiseError
                     else
                         let! response = (this :> IReasoningModel).Generate request
                         match response.ToolCalls with
@@ -74,11 +68,21 @@ type ReasoningModel(client: ILlmClient) =
                             let toolMessages =
                                 toolResults
                                 |> Array.toList
-                                |> List.map (fun result ->
+                                |> List.mapi (fun i result ->
+                                    let call = toolCalls[i]
+                                    let callId =
+                                        if String.IsNullOrWhiteSpace(result.CallId) then call.CallId else result.CallId
+
+                                    let payload =
+                                        {| call_id = callId
+                                           tool_name = call.Name
+                                           output = result.OutputJson |}
+                                        |> JsonSerializer.Serialize
+
                                     {
                                         Role = ChatRole.Tool
-                                        Name = None
-                                        Parts = [ ContentPart.Json result.OutputJson ]
+                                        Name = Some call.Name
+                                        Parts = [ ContentPart.Json payload ]
                                     })
 
                             let nextRequest =

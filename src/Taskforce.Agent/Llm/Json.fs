@@ -17,7 +17,6 @@ module Json =
         with ex ->
             LlmError.InvalidProviderResponse(provider, ex.Message)
             |> LlmError.raiseError
-            failwith "unreachable"
 
     let textPart text =
         let o = JsonObject()

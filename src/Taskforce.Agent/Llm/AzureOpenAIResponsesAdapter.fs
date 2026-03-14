@@ -30,5 +30,21 @@ type AzureOpenAIResponsesAdapter(httpClient: HttpClient) =
                 this.SendResponsesRequest(LlmProvider.AzureOpenAI, url, authHeaders, request, azureConfig.Deployment)
             | _ -> LlmError.InvalidRequest("Expected Azure OpenAI config for Azure OpenAI adapter") |> LlmError.raiseError
 
-        member _.Stream _config _request =
-            raise (NotSupportedException("Streaming is planned for phase 2."))
+        member this.Stream config request =
+            match config with
+            | LlmConfig.AzureOpenAIConfig azureConfig ->
+                let endpoint = azureConfig.Endpoint.TrimEnd('/')
+                let url = endpoint + "/openai/v1/responses"
+
+                let authHeaders (req: HttpRequestMessage) =
+                    match azureConfig.ApiKey, azureConfig.UseEntraId, azureConfig.EntraToken with
+                    | Some apiKey, _, _ ->
+                        req.Headers.TryAddWithoutValidation("api-key", apiKey) |> ignore
+                    | None, true, Some bearer ->
+                        req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {bearer}") |> ignore
+                    | _ ->
+                        LlmError.InvalidRequest("AzureOpenAI requires either ApiKey or EntraToken when UseEntraId=true")
+                        |> LlmError.raiseError
+
+                this.SendResponsesStreamRequest(LlmProvider.AzureOpenAI, url, authHeaders, request, azureConfig.Deployment)
+            | _ -> LlmError.InvalidRequest("Expected Azure OpenAI config for Azure OpenAI adapter") |> LlmError.raiseError
