@@ -12,6 +12,7 @@
     <Compile Include="Llm/Errors.fs" />
     <Compile Include="Llm/Json.fs" />
     <Compile Include="Llm/ToolLoop.fs" />
+    <Compile Include="Llm/LlmTaskAnalyzer.fs" />
     <Compile Include="Llm/OpenAIResponsesAdapter.fs" />
     <Compile Include="Llm/AzureOpenAIResponsesAdapter.fs" />
     <Compile Include="Llm/AnthropicMessagesAdapter.fs" />

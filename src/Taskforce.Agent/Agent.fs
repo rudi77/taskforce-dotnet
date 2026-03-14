@@ -188,7 +188,11 @@ module MemoryPolicies =
 
 [<RequireQualifiedAccess>]
 module TaskAnalyzers =
-    let heuristic () =
+    let llmBased (classifyWithLlm: AgentState -> string -> Async<TaskComplexity list * AgentIntent>) =
+        { new ITaskAnalyzer with
+            member _.Classify state input = classifyWithLlm state input }
+
+    let heuristicFallback () =
         { new ITaskAnalyzer with
             member _.Classify state input =
                 async {

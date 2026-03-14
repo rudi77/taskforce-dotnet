@@ -1,7 +1,10 @@
 namespace Taskforce.Agent.Llm
 
 open System
+open System.IO
 open System.Net.Http
+open System.Threading
+open System.Threading.Tasks
 open System.Text.Json
 open System.Text.Json.Nodes
 open System.Collections.Generic
@@ -22,6 +25,9 @@ type ResponsesAdapterBase(httpClient: HttpClient) =
         |> List.iter input.Add
 
         root["input"] <- input
+
+        if request.Stream then
+            root["stream"] <- JsonValue.Create(true)
 
         match request.Temperature with
         | Some temperature -> root["temperature"] <- JsonValue.Create(temperature)
@@ -61,6 +67,196 @@ type ResponsesAdapterBase(httpClient: HttpClient) =
             root["text"] <- text
 
         Json.serializeNode root
+
+    member this.ParseResponsesStreamEvent(provider: LlmProvider, eventJson: string) : LlmStreamEvent list * LlmResponse option =
+        use doc = JsonDocument.Parse(eventJson)
+        let root = doc.RootElement
+
+        let eventType =
+            let mutable t = Unchecked.defaultof<JsonElement>
+            if root.TryGetProperty("type", &t) && t.ValueKind = JsonValueKind.String then t.GetString()
+            else ""
+
+        match eventType with
+        | "response.output_text.delta" ->
+            let mutable delta = Unchecked.defaultof<JsonElement>
+            if root.TryGetProperty("delta", &delta) && delta.ValueKind = JsonValueKind.String then
+                [ LlmStreamEvent.TextDelta(delta.GetString()) ], None
+            else
+                [], None
+        | "response.output_item.added" ->
+            let mutable item = Unchecked.defaultof<JsonElement>
+            if root.TryGetProperty("item", &item) then
+                let mutable t = Unchecked.defaultof<JsonElement>
+                let isFunctionCall = item.TryGetProperty("type", &t) && t.ValueKind = JsonValueKind.String && t.GetString() = "function_call"
+
+                if isFunctionCall then
+                    let callId =
+                        let mutable c = Unchecked.defaultof<JsonElement>
+                        if item.TryGetProperty("call_id", &c) && c.ValueKind = JsonValueKind.String then c.GetString()
+                        else Guid.NewGuid().ToString("N")
+                    let name =
+                        let mutable n = Unchecked.defaultof<JsonElement>
+                        if item.TryGetProperty("name", &n) && n.ValueKind = JsonValueKind.String then n.GetString()
+                        else "unknown_tool"
+
+                    let call = { CallId = callId; Name = name; ArgumentsJson = "{}" }
+                    [ LlmStreamEvent.ToolCallStarted call ], None
+                else
+                    [], None
+            else
+                [], None
+        | "response.function_call_arguments.delta" ->
+            let callId =
+                let mutable id = Unchecked.defaultof<JsonElement>
+                if root.TryGetProperty("call_id", &id) && id.ValueKind = JsonValueKind.String then id.GetString()
+                else ""
+
+            let delta =
+                let mutable d = Unchecked.defaultof<JsonElement>
+                if root.TryGetProperty("delta", &d) && d.ValueKind = JsonValueKind.String then d.GetString()
+                else ""
+
+            if String.IsNullOrWhiteSpace(callId) || String.IsNullOrEmpty(delta) then
+                [], None
+            else
+                [ LlmStreamEvent.ToolCallDelta(callId, delta) ], None
+        | "response.completed" ->
+            let mutable response = Unchecked.defaultof<JsonElement>
+            if root.TryGetProperty("response", &response) then
+                let parsed = this.ParseResponse(provider, response.GetRawText())
+                [ LlmStreamEvent.Completed parsed ], Some parsed
+            else
+                [], None
+        | _ ->
+            [], None
+
+    member this.SendResponsesStreamRequest(provider, url: string, authHeaders: (HttpRequestMessage -> unit), request: LlmRequest, modelName: string) : IAsyncEnumerable<LlmStreamEvent> =
+        let streamRequest = { request with Stream = true }
+        let payload = this.BuildPayload(provider, streamRequest, modelName)
+
+        let mutable initialized = false
+        let mutable completed = false
+        let mutable responseMsg: HttpResponseMessage option = None
+        let mutable responseStream: Stream option = None
+        let mutable reader: StreamReader option = None
+        let pending = Queue<LlmStreamEvent>()
+        let mutable lastResponse: LlmResponse option = None
+
+        let initialize () =
+            task {
+                if not initialized then
+                    initialized <- true
+                    let req = new HttpRequestMessage(HttpMethod.Post, url)
+                    req.Content <- Json.utf8 payload
+                    authHeaders req
+
+                    let! response = httpClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead)
+                    if not response.IsSuccessStatusCode then
+                        let! body = response.Content.ReadAsStringAsync()
+                        response.Dispose()
+                        LlmError.ProviderHttpError(provider, int response.StatusCode, body) |> LlmError.raiseError
+
+                    let! stream = response.Content.ReadAsStreamAsync()
+                    responseMsg <- Some response
+                    responseStream <- Some stream
+                    reader <- Some(new StreamReader(stream))
+            }
+
+        let disposeAll () =
+            reader |> Option.iter (fun r -> r.Dispose())
+            responseStream |> Option.iter (fun s -> s.Dispose())
+            responseMsg |> Option.iter (fun r -> r.Dispose())
+            reader <- None
+            responseStream <- None
+            responseMsg <- None
+
+        let rec readNextEvent (r: StreamReader) (dataLines: ResizeArray<string>) =
+            task {
+                let! line = r.ReadLineAsync()
+                if isNull line then
+                    if dataLines.Count = 0 then
+                        return None
+                    else
+                        return Some(String.concat "\n" dataLines)
+                elif String.IsNullOrWhiteSpace(line) then
+                    if dataLines.Count = 0 then
+                        return! readNextEvent r dataLines
+                    else
+                        return Some(String.concat "\n" dataLines)
+                elif line.StartsWith("data:", StringComparison.OrdinalIgnoreCase) then
+                    dataLines.Add(line.Substring(5).TrimStart())
+                    return! readNextEvent r dataLines
+                else
+                    return! readNextEvent r dataLines
+            }
+
+        { new IAsyncEnumerable<LlmStreamEvent> with
+            member _.GetAsyncEnumerator(_ct: CancellationToken) =
+                { new IAsyncEnumerator<LlmStreamEvent> with
+                    member val Current = LlmStreamEvent.Failed "stream_not_started" with get, set
+
+                    member self.MoveNextAsync() =
+                        ValueTask<bool>(
+                            task {
+                                do! initialize ()
+
+                                if pending.Count > 0 then
+                                    self.Current <- pending.Dequeue()
+                                    return true
+                                elif completed then
+                                    return false
+                                else
+                                    match reader with
+                                    | None ->
+                                        completed <- true
+                                        return false
+                                    | Some r ->
+                                        let! maybeEvent = readNextEvent r (ResizeArray())
+                                        match maybeEvent with
+                                        | None ->
+                                            completed <- true
+
+                                            if lastResponse.IsNone then
+                                                let fallback =
+                                                    {
+                                                        Text = None
+                                                        ToolCalls = []
+                                                        FinishReason = FinishReason.Unknown "stream_ended_without_completed_event"
+                                                        Usage = None
+                                                        RawProviderPayload = None
+                                                    }
+                                                self.Current <- LlmStreamEvent.Completed fallback
+                                                lastResponse <- Some fallback
+                                                return true
+
+                                            return false
+                                        | Some raw when raw = "[DONE]" ->
+                                            completed <- true
+                                            return false
+                                        | Some raw ->
+                                            try
+                                                let events, parsedFinal = this.ParseResponsesStreamEvent(provider, raw)
+                                                parsedFinal |> Option.iter (fun p -> lastResponse <- Some p)
+                                                events |> List.iter pending.Enqueue
+
+                                                if pending.Count = 0 then
+                                                    return! self.MoveNextAsync().AsTask()
+                                                else
+                                                    self.Current <- pending.Dequeue()
+                                                    return true
+                                            with ex ->
+                                                self.Current <- LlmStreamEvent.Failed ex.Message
+                                                completed <- true
+                                                return true
+                            }
+                        )
+
+                    member _.DisposeAsync() =
+                        completed <- true
+                        disposeAll ()
+                        ValueTask(Task.CompletedTask)
+                } }
 
     member _.ParseResponse(provider: LlmProvider, rawResponse: string) =
         use doc = JsonDocument.Parse(rawResponse)
@@ -187,5 +383,20 @@ type OpenAIResponsesAdapter(httpClient: HttpClient) =
                 )
             | _ -> LlmError.InvalidRequest("Expected OpenAI config for OpenAI adapter") |> LlmError.raiseError
 
-        member _.Stream _config _request =
-            raise (NotSupportedException("Streaming is planned for phase 2."))
+        member this.Stream config request =
+            match config with
+            | LlmConfig.OpenAIConfig openAiConfig ->
+                let (ModelId modelName) = request.Model
+                let baseUrl =
+                    if String.IsNullOrWhiteSpace(openAiConfig.BaseUrl) then "https://api.openai.com/v1"
+                    else openAiConfig.BaseUrl.TrimEnd('/')
+
+                let url = baseUrl + "/responses"
+                this.SendResponsesStreamRequest(
+                    LlmProvider.OpenAI,
+                    url,
+                    (fun req -> req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {openAiConfig.ApiKey}") |> ignore),
+                    request,
+                    modelName
+                )
+            | _ -> LlmError.InvalidRequest("Expected OpenAI config for OpenAI adapter") |> LlmError.raiseError
