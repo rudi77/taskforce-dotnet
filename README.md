@@ -14,6 +14,7 @@ Ein minimaler F# Agentenkern in hexagonaler Architektur.
 - Explizite Agent-Entscheidungen (`AgentDecision`)
 - Input-/Output-/Effect-Modell für den Kern
 - Ports für Analyzer, Planner, Reasoner, MemoryStore und ToolInvoker
+- Built-in LLM-Tools (`BuiltinTools.definitions` + `BuiltinTools.createInvoker`) für `ReadFile`, `WriteFile` (mit `append`), `EditFile`, `Glob`, `Grep`, `Shell` (PowerShell/Bash) und `WebSearch`
 - LLM-basierte `ITaskAnalyzer`-Implementierung (`LlmTaskAnalyzer`) mit heuristischem Fallback (`TaskAnalyzers.heuristicFallback`)
 - Schwellwertbasierte Memory-Policy
 - `AgentKernel.Step`: `State + Input -> Decision -> Effects -> NewState`
