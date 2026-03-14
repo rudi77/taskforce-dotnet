@@ -7,5 +7,13 @@
 
   <ItemGroup>
     <Compile Include="Agent.fs" />
+    <Compile Include="Llm/Types.fs" />
+    <Compile Include="Llm/Ports.fs" />
+    <Compile Include="Llm/Errors.fs" />
+    <Compile Include="Llm/Json.fs" />
+    <Compile Include="Llm/ToolLoop.fs" />
+    <Compile Include="Llm/OpenAIResponsesAdapter.fs" />
+    <Compile Include="Llm/AzureOpenAIResponsesAdapter.fs" />
+    <Compile Include="Llm/AnthropicMessagesAdapter.fs" />
   </ItemGroup>
 </Project>
