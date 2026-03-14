@@ -1,6 +1,7 @@
 namespace Taskforce.Agent
 
 open System
+open System.Collections.Generic
 
 [<Struct>]
 type AgentId = AgentId of string
@@ -275,6 +276,41 @@ type AgentKernel(
                     }
         }
 
+    let enrichStateWithMemoryRecall query state =
+        async {
+            if not capabilities.CanRemember || String.IsNullOrWhiteSpace(query) then
+                return state
+            else
+                let! recalled = memoryStore.Recall state.AgentId query
+
+                let recalledFacts =
+                    recalled
+                    |> List.sortByDescending (fun item -> item.Relevance)
+                    |> List.truncate 5
+                    |> List.map (fun item -> $"[memory:{item.MemoryId}] {item.Content}")
+
+                if recalledFacts.IsEmpty then
+                    return state
+                else
+                    let nextFacts =
+                        recalledFacts @ state.Working.IntermediateFacts
+                        |> List.distinct
+                        |> List.truncate 50
+
+                    return { state with Working = { state.Working with IntermediateFacts = nextFacts } }
+        }
+
+    let decisionPriority = function
+        | UpdatePlan _
+        | CreatePlan _ -> 0
+        | ExecuteStep _ -> 1
+        | CallTool _ -> 2
+        | DirectResponse _
+        | Escalate _ -> 3
+        | ReplyAndStoreMemory _ -> 4
+        | StoreMemory _ -> 5
+        | NoOp -> 6
+
     let handleReasonerDecision state decision =
         async {
             match decision with
@@ -284,13 +320,6 @@ type AgentKernel(
                 let! plan = planner.CreatePlan state goal
                 return Planning.updateWorkingPlan plan state, [ ReplacePlan plan ]
             | UpdatePlan reason when capabilities.CanReplan ->
-                let currentPlan =
-                    {
-                        PlanId = Guid.NewGuid().ToString("N")
-                        Goal = state.Working.CurrentGoal |> Option.defaultValue ""
-                        Steps = state.Working.CurrentPlan
-                        CreatedAtUtc = DateTime.UtcNow
-                    }
                 let! plan = planner.UpdatePlan state (BetterPathFound reason)
                 return Planning.updateWorkingPlan plan state, [ ReplacePlan plan; RequestReplan(BetterPathFound reason) ]
             | ExecuteStep stepId ->
@@ -318,6 +347,25 @@ type AgentKernel(
                 return state, []
         }
 
+    let applyDecisions state decisions =
+        async {
+            let ordered =
+                decisions
+                |> List.mapi (fun index decision -> index, decision)
+                |> List.sortBy (fun (index, decision) -> decisionPriority decision, index)
+                |> List.map snd
+
+            let effects = ResizeArray<AgentEffect>()
+            let mutable currentState = state
+
+            for decision in ordered do
+                let! nextState, producedEffects = handleReasonerDecision currentState decision
+                currentState <- nextState
+                producedEffects |> List.iter effects.Add
+
+            return currentState, effects |> Seq.toList
+        }
+
     interface IAgentKernel with
         member _.Step state input =
             async {
@@ -328,6 +376,7 @@ type AgentKernel(
 
                 match input with
                 | UserMessage text ->
+                    let! state = enrichStateWithMemoryRecall text state
                     let! (_, intent) = analyzer.Classify state text
                     if intent = PlanFirst && capabilities.CanPlan then
                         let! plan = planner.CreatePlan state text
@@ -335,14 +384,7 @@ type AgentKernel(
                         return state', [ ReplacePlan plan ]
                     else
                         let! decisions = reasoner.Decide state input
-                        let! updates =
-                            decisions
-                            |> List.map (handleReasonerDecision state)
-                            |> Async.Parallel
-
-                        let latestState = updates |> Array.fold (fun s (next, _) -> next) state
-                        let effects = updates |> Array.toList |> List.collect snd
-                        return latestState, effects
+                        return! applyDecisions state decisions
 
                 | ToolReturned result when not result.Success && capabilities.CanReplan ->
                     let reason = result.Error |> Option.defaultValue "Tool call failed"
@@ -376,13 +418,7 @@ type AgentKernel(
 
                 | _ ->
                     let! decisions = reasoner.Decide state input
-                    let! updates =
-                        decisions
-                        |> List.map (handleReasonerDecision state)
-                        |> Async.Parallel
-                    let latestState = updates |> Array.fold (fun s (next, _) -> next) state
-                    let effects = updates |> Array.toList |> List.collect snd
-                    return latestState, effects
+                    return! applyDecisions state decisions
             }
 
 [<RequireQualifiedAccess>]
